@@ -57,24 +57,55 @@ const NstartHand = () => (
 
 // ── NIP-07 Nostr login ────────────────────────────────────────────────────────
 declare global { interface Window { nostr?: { getPublicKey(): Promise<string>; signEvent(e: object): Promise<object> } } }
+
+// Module-level pubkey store with subscribers so every useNostrLogin() call
+// shares one source of truth. Fixes the bug where the nav-bar NostrLogin and
+// the Index body each had their own useState — login from the button didn't
+// re-render the body until a page refresh re-read localStorage.
+let _nostrPubkey: string | null = null;
+let _nostrInitialized = false;
+const _nostrSubs = new Set<(p: string | null) => void>();
+function _readInitialPubkey(): string | null {
+  try {
+    const p = new URLSearchParams(window.location.search).get('nostr_pk');
+    if (p) { localStorage.setItem('nostr_pubkey', p); return p; }
+    return localStorage.getItem('nostr_pubkey');
+  } catch { return null; }
+}
+function _setNostrPubkey(p: string | null) {
+  _nostrPubkey = p;
+  _nostrSubs.forEach(fn => fn(p));
+}
+
 function useNostrLogin() {
-  const [pubkey, setPubkey] = useState<string | null>(() => {
-    try {
-      const p = new URLSearchParams(window.location.search).get('nostr_pk');
-      if (p) { localStorage.setItem('nostr_pubkey', p); return p; }
-      return localStorage.getItem('nostr_pubkey');
-    } catch { return null; }
+  const [pubkey, setLocal] = useState<string | null>(() => {
+    if (!_nostrInitialized) { _nostrPubkey = _readInitialPubkey(); _nostrInitialized = true; }
+    return _nostrPubkey;
   });
-  useEffect(() => { if (new URLSearchParams(window.location.search).get('nostr_pk')) window.history.replaceState({}, '', window.location.pathname); }, []);
+  useEffect(() => {
+    _nostrSubs.add(setLocal);
+    return () => { _nostrSubs.delete(setLocal); };
+  }, []);
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get('nostr_pk')) {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  }, []);
   const login = async () => {
     if (typeof window !== 'undefined' && window.nostr) {
-      try { const pk = await window.nostr.getPublicKey(); if (pk) { setPubkey(pk); localStorage.setItem('nostr_pubkey', pk); } } catch {}
+      try {
+        const pk = await window.nostr.getPublicKey();
+        if (pk) { localStorage.setItem('nostr_pubkey', pk); _setNostrPubkey(pk); }
+      } catch {}
       return;
     }
     const cb = `${window.location.origin}${window.location.pathname}?nostr_pk={signature}`;
     window.location.href = `nostrsigner:getpubkey?compressionType=none&returnType=signature&type=get_public_key&callbackUrl=${encodeURIComponent(cb)}`;
   };
-  const logout = () => { setPubkey(null); try { localStorage.removeItem('nostr_pubkey'); } catch {} };
+  const logout = () => {
+    try { localStorage.removeItem('nostr_pubkey'); } catch {} /* */
+    _setNostrPubkey(null);
+  };
   return { pubkey, login, logout };
 }
 // Light-weight kind:0 lookup so the nav login button can show the user's
@@ -168,6 +199,7 @@ interface AudioSample {
   title: string;
   size?: number;
   format?: string;
+  tagged?: string[];
 }
 
 const MIME_TO_FORMAT: Record<string, string> = {
@@ -308,9 +340,11 @@ function useAudioFeed() {
         }
         if (!url) return;
         const format = deriveFormat(mime, url);
+        const taggedHexes = e.tags.filter(t => t[0] === 'p' && /^[0-9a-f]{64}$/i.test(t[1] || '')).map(t => t[1].toLowerCase());
+        const tagged = taggedHexes.length > 0 ? taggedHexes : undefined;
         setSamples(prev => {
           if (prev.find(s => s.id === e.id)) return prev;
-          return [{ id: e.id, pubkey: e.pubkey, created_at: e.created_at, url, title, size, format }, ...prev]
+          return [{ id: e.id, pubkey: e.pubkey, created_at: e.created_at, url, title, size, format, tagged }, ...prev]
             .sort((a, b) => b.created_at - a.created_at).slice(0, 50);
         });
       } catch {}
@@ -326,11 +360,13 @@ function useAudioFeed() {
 }
 
 // ── Publish audio note ────────────────────────────────────────────────────────
-async function publishAudio(pubkey: string, url: string, title: string, mime: string): Promise<boolean> {
+async function publishAudio(pubkey: string, url: string, title: string, mime: string, taggedHexes: string[] = []): Promise<boolean> {
+  void pubkey;
   if (!window.nostr) return false;
   try {
     const tags: string[][] = [['url', url], ['m', mime || 'audio/mpeg']];
     if (title) tags.push(['alt', title]);
+    for (const hex of taggedHexes) tags.push(['p', hex, '', 'mention']);
     const template = { kind: 1063, created_at: Math.floor(Date.now() / 1000), tags, content: title || url };
     const signed = await window.nostr.signEvent(template) as object;
     const ws = new WebSocket(RELAY_URL);
@@ -342,6 +378,26 @@ async function publishAudio(pubkey: string, url: string, title: string, mime: st
     });
     return true;
   } catch { return false; }
+}
+
+// ── NIP-05 resolver (name@domain → hex pubkey) ───────────────────────────────
+async function resolveNip05(nip05: string, timeoutMs = 6000): Promise<string | null> {
+  const at = nip05.indexOf('@');
+  if (at <= 0) return null;
+  const name = nip05.slice(0, at).toLowerCase().trim();
+  const domain = nip05.slice(at + 1).trim();
+  if (!name || !domain) return null;
+  try {
+    const res = await fetch(`https://${domain}/.well-known/nostr.json?name=${encodeURIComponent(name)}`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const hex = json?.names?.[name];
+    return typeof hex === 'string' && /^[0-9a-f]{64}$/i.test(hex) ? hex.toLowerCase() : null;
+  } catch {
+    return null;
+  }
 }
 
 // ── Waveform ──────────────────────────────────────────────────────────────────
@@ -458,6 +514,11 @@ function SampleCard({ sample }: { sample: AudioSample }) {
             {size != null && ` · ${formatBytes(size)}`}
             {sampleRate != null && ` · ${(sampleRate / 1000).toFixed(1)} kHz`}
           </p>
+          {sample.tagged && sample.tagged.length > 0 && (
+            <p className="text-[10px] font-mono text-accent/60 mt-1">
+              tagged: {sample.tagged.map(h => h.slice(0, 8) + '…').join(', ')}
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <button onClick={copyShare} title="Copy note link" className="text-muted-foreground hover:text-primary transition-colors">
@@ -479,6 +540,41 @@ function SampleCard({ sample }: { sample: AudioSample }) {
         {playing ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
         {playing ? 'pause' : 'play'}
       </button>
+    </div>
+  );
+}
+
+// ── SampleRow (compact one-line view) ─────────────────────────────────────────
+function SampleRow({ sample }: { sample: AudioSample }) {
+  const [playing, setPlaying] = useState(false);
+  const audioRef = useRef<HTMLAudioElement>(null);
+
+  const toggle = () => {
+    const el = audioRef.current;
+    if (!el) return;
+    if (playing) { el.pause(); setPlaying(false); }
+    else { el.play().then(() => setPlaying(true)).catch(() => {}); }
+  };
+
+  return (
+    <div className="flex items-center gap-3 px-3 py-1.5 hover:bg-primary/5 transition-colors">
+      <button onClick={toggle} aria-label={playing ? 'pause' : 'play'}
+        className="shrink-0 w-7 h-7 rounded-full border border-border hover:border-primary/50 text-muted-foreground hover:text-primary transition-colors flex items-center justify-center">
+        {playing ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
+      </button>
+      <p className="flex-1 min-w-0 text-[12px] font-mono text-foreground truncate" title={sample.title}>{sample.title}</p>
+      {sample.format && (
+        <span className="shrink-0 text-[10px] font-mono text-muted-foreground/40 uppercase tracking-wider">{sample.format}</span>
+      )}
+      <span className="shrink-0 text-[10px] font-mono text-muted-foreground/50">{sample.pubkey.slice(0, 8)}…</span>
+      {sample.tagged && sample.tagged.length > 0 && (
+        <span className="shrink-0 text-[10px] font-mono text-accent/60" title={`${sample.tagged.length} tagged`}>·{sample.tagged.length}</span>
+      )}
+      <span className="shrink-0 text-[10px] font-mono text-muted-foreground/50 tabular-nums w-14 text-right">
+        {new Date(sample.created_at * 1000).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })}
+      </span>
+      <audio ref={audioRef} src={sample.url} preload="none" crossOrigin="anonymous"
+        onEnded={() => setPlaying(false)} onError={() => setPlaying(false)} />
     </div>
   );
 }
@@ -517,21 +613,31 @@ async function uploadToNostrBuild(file: File): Promise<string> {
 }
 
 function UploadArea({ pubkey }: { pubkey: string }) {
-  const [mode, setMode]   = useState<'url' | 'file'>('url');
   const [url, setUrl]     = useState('');
   const [title, setTitle] = useState('');
   const [mime, setMime]   = useState('audio/mpeg');
   const [file, setFile]   = useState<File | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const [tagsInput, setTagsInput] = useState('');
+  const [tagStatus, setTagStatus] = useState<{ ok: number; failed: string[] } | null>(null);
   const [status, setStatus] = useState<'idle' | 'uploading' | 'busy' | 'ok' | 'err'>('idle');
   const fileRef = useRef<HTMLInputElement>(null);
 
-  const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0] ?? null;
+  const setSelectedFile = (f: File | null) => {
     setFile(f);
     if (f) {
       setMime(f.type || 'audio/mpeg');
       if (!title) setTitle(f.name.replace(/\.[^.]+$/, ''));
     }
+  };
+
+  const onDragOver  = (e: React.DragEvent) => { e.preventDefault(); setDragOver(true); };
+  const onDragLeave = () => setDragOver(false);
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    const f = e.dataTransfer.files?.[0];
+    if (f) setSelectedFile(f);
   };
 
   const submit = async (e: React.FormEvent) => {
@@ -540,17 +646,22 @@ function UploadArea({ pubkey }: { pubkey: string }) {
     try {
       let finalUrl = url.trim();
       let finalMime = mime;
-      if (mode === 'file') {
-        if (!file) { setStatus('idle'); return; }
+      if (file) {  // file takes precedence over URL
         setStatus('uploading');
         finalUrl = await uploadToNostrBuild(file);
         finalMime = file.type || mime;
         setStatus('busy');
       }
       if (!finalUrl) { setStatus('idle'); return; }
-      const ok = await publishAudio(pubkey, finalUrl, title.trim(), finalMime);
+      // Resolve any nip05 tags into hex pubkeys (parallel, best-effort)
+      const nip05List = tagsInput.split(',').map(s => s.trim()).filter(Boolean);
+      const results = await Promise.all(nip05List.map(async n => ({ n, hex: await resolveNip05(n) })));
+      const resolvedHexes = results.filter(r => r.hex).map(r => r.hex as string);
+      const failed = results.filter(r => !r.hex).map(r => r.n);
+      setTagStatus(nip05List.length > 0 ? { ok: resolvedHexes.length, failed } : null);
+      const ok = await publishAudio(pubkey, finalUrl, title.trim(), finalMime, resolvedHexes);
       setStatus(ok ? 'ok' : 'err');
-      if (ok) { setUrl(''); setTitle(''); setFile(null); if (fileRef.current) fileRef.current.value = ''; }
+      if (ok) { setUrl(''); setTitle(''); setFile(null); setTagsInput(''); if (fileRef.current) fileRef.current.value = ''; }
     } catch {
       setStatus('err');
     }
@@ -558,49 +669,48 @@ function UploadArea({ pubkey }: { pubkey: string }) {
   };
 
   const busy = status === 'uploading' || status === 'busy';
-  const canSubmit = mode === 'url' ? !!url.trim() : !!file;
+  const canSubmit = !!file || !!url.trim();
+  const inputCls = "bg-transparent border border-border px-2.5 py-1.5 text-[11px] font-mono text-foreground placeholder:text-muted-foreground/40 outline-none focus:border-primary/60 transition-colors";
 
   return (
-    <form onSubmit={submit} className="bg-card border border-border p-4 space-y-3">
-      {/* Mode toggle */}
-      <div className="flex border border-border">
-        {(['url', 'file'] as const).map(m => (
-          <button key={m} type="button" onClick={() => setMode(m)}
-            className={`flex-1 py-1.5 text-xs font-mono transition-colors ${mode === m ? 'bg-primary/10 text-primary border-b-2 border-primary' : 'text-muted-foreground hover:text-foreground'}`}>
-            {m === 'url' ? 'paste url' : 'local file'}
-          </button>
-        ))}
+    <form onSubmit={submit} className="bg-card border border-border p-3 space-y-2">
+      {/* Drop zone — both drag-and-drop and click-to-browse */}
+      <div
+        onClick={() => fileRef.current?.click()}
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
+        className={`border border-dashed transition-colors cursor-pointer px-3 py-3 text-center ${dragOver ? 'border-primary bg-primary/10' : 'border-border hover:border-primary/40'}`}>
+        <input ref={fileRef} type="file" accept="audio/*"
+          onChange={e => setSelectedFile(e.target.files?.[0] ?? null)} className="hidden" />
+        {file ? (
+          <p className="text-[11px] font-mono text-foreground truncate flex items-center justify-center gap-2">
+            <Upload className="h-3 w-3 text-primary shrink-0" />
+            <span className="truncate">{file.name}</span>
+            <button type="button" onClick={(e) => { e.stopPropagation(); setSelectedFile(null); if (fileRef.current) fileRef.current.value=''; }}
+              className="text-muted-foreground/60 hover:text-foreground shrink-0 ml-1" aria-label="remove file">×</button>
+          </p>
+        ) : (
+          <p className="text-[11px] font-mono text-muted-foreground/60">
+            <Upload className="h-3 w-3 inline-block mr-1.5 align-text-bottom" />
+            Drop audio file, or tap to browse
+          </p>
+        )}
       </div>
 
-      {mode === 'url' ? (
-        <input type="url" value={url} onChange={e => setUrl(e.target.value)}
-          placeholder="Audio URL (https://…mp3)"
-          className="w-full bg-transparent border border-border px-3 py-2 text-sm font-mono text-foreground placeholder:text-muted-foreground/40 outline-none focus:border-primary/60 transition-colors" />
-      ) : (
-        <div
-          className="border border-dashed border-border hover:border-primary/50 transition-colors cursor-pointer"
-          onClick={() => fileRef.current?.click()}>
-          <input ref={fileRef} type="file" accept="audio/*" onChange={onFileChange} className="hidden" />
-          <div className="px-3 py-6 text-center">
-            {file ? (
-              <p className="text-sm font-mono text-foreground truncate">{file.name}</p>
-            ) : (
-              <>
-                <Upload className="h-4 w-4 text-muted-foreground/40 mx-auto mb-2" />
-                <p className="text-xs font-mono text-muted-foreground/60">Click to choose an audio file</p>
-              </>
-            )}
-          </div>
-        </div>
-      )}
+      {/* OR paste URL (disabled when a file is queued) */}
+      <input type="url" value={url} onChange={e => setUrl(e.target.value)} disabled={!!file}
+        placeholder="…or paste audio URL"
+        className={`w-full ${inputCls} disabled:opacity-30 disabled:cursor-not-allowed`} />
 
+      {/* Title + format */}
       <div className="flex gap-2">
         <input type="text" value={title} onChange={e => setTitle(e.target.value)}
           placeholder="Title (optional)"
-          className="flex-1 bg-transparent border border-border px-3 py-2 text-sm font-mono text-foreground placeholder:text-muted-foreground/40 outline-none focus:border-primary/60 transition-colors" />
-        {mode === 'url' && (
+          className={`flex-1 ${inputCls}`} />
+        {!file && (
           <select value={mime} onChange={e => setMime(e.target.value)}
-            className="bg-card border border-border px-3 py-2 text-xs font-mono text-muted-foreground outline-none focus:border-primary/60 transition-colors">
+            className="bg-card border border-border px-2 py-1.5 text-[10px] font-mono text-muted-foreground outline-none focus:border-primary/60 transition-colors">
             <option value="audio/mpeg">mp3</option>
             <option value="audio/ogg">ogg</option>
             <option value="audio/wav">wav</option>
@@ -611,11 +721,31 @@ function UploadArea({ pubkey }: { pubkey: string }) {
         )}
       </div>
 
-      <button type="submit" disabled={!canSubmit || busy}
-        className="w-full font-mono text-xs py-2 border border-primary/50 text-primary hover:bg-primary/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2">
-        <Upload className="h-3 w-3" />
-        {status === 'uploading' ? 'uploading…' : status === 'busy' ? 'publishing…' : status === 'ok' ? 'published ✓' : status === 'err' ? 'failed ✗' : 'publish to nostr'}
-      </button>
+      {/* Optional NIP-05 tagging */}
+      <input type="text" value={tagsInput} onChange={e => setTagsInput(e.target.value)}
+        placeholder="Tag users (optional, nurture@fizx.uk, …)"
+        className={`w-full ${inputCls}`} />
+
+      {tagStatus && tagStatus.failed.length > 0 && (
+        <p className="text-[10px] font-mono text-yellow-400/70">
+          tagged {tagStatus.ok}, couldn't resolve: {tagStatus.failed.join(', ')}
+        </p>
+      )}
+
+      {/* Submit row — compact, right-aligned */}
+      <div className="flex items-center justify-end gap-3 pt-0.5">
+        <span className="text-[10px] font-mono text-muted-foreground/60">
+          {status === 'uploading' ? 'uploading…' :
+           status === 'busy'      ? 'publishing…' :
+           status === 'ok'        ? '✓ published' :
+           status === 'err'       ? '✗ failed'   : ''}
+        </span>
+        <button type="submit" disabled={!canSubmit || busy}
+          className="font-mono text-[11px] px-4 py-1.5 border border-primary/50 text-primary hover:bg-primary/10 disabled:opacity-30 disabled:cursor-not-allowed transition-colors flex items-center gap-1.5">
+          <Upload className="h-3 w-3" />
+          publish
+        </button>
+      </div>
     </form>
   );
 }
@@ -625,6 +755,11 @@ export default function Index() {
   const { pubkey } = useNostrLogin();
   const { samples, isLoading, isError } = useAudioFeed();
   const [tick, setTick] = useState(0);
+  const [view, setView] = useState<'compact' | 'full'>(() => {
+    try { const v = localStorage.getItem('smpl_view'); if (v === 'compact' || v === 'full') return v; } catch {} /* */
+    return 'compact';
+  });
+  useEffect(() => { try { localStorage.setItem('smpl_view', view); } catch {} /* */ }, [view]);
   useEffect(() => {
     const id = setInterval(() => setTick(t => (t < SQUARE_COUNT ? t + 1 : 0)), 1000);
     return () => clearInterval(id);
@@ -649,6 +784,9 @@ export default function Index() {
               </div>
             </>;
           })()}
+          <a href="https://github.com/macos-node/smpl.upleb.uk" target="_blank" rel="noopener noreferrer" title="Source on GitHub" aria-label="Source on GitHub" className="shrink-0 text-muted-foreground/60 hover:text-primary transition-colors">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56 0-.28-.01-1.02-.02-2-3.2.69-3.88-1.54-3.88-1.54-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.71.08-.71 1.16.08 1.77 1.19 1.77 1.19 1.03 1.77 2.71 1.26 3.37.96.1-.75.4-1.26.73-1.55-2.55-.29-5.24-1.28-5.24-5.7 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18.92-.26 1.91-.39 2.89-.39.98 0 1.97.13 2.89.39 2.21-1.49 3.18-1.18 3.18-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.43-2.69 5.41-5.25 5.69.41.36.77 1.07.77 2.16 0 1.56-.01 2.82-.01 3.21 0 .31.21.68.8.56 4.56-1.52 7.85-5.83 7.85-10.91C23.5 5.65 18.35.5 12 .5z"/></svg>
+          </a>
           <div className="shrink-0 flex justify-end w-[34px] sm:w-[160px]"><NostrLogin /></div>
         </div>
       </nav>
@@ -710,6 +848,14 @@ export default function Index() {
               <span className="text-[9px] font-mono text-muted-foreground/50">{samples.length}</span>
             )}
             {isLoading && <Radio className="w-3 h-3 text-primary animate-pulse" />}
+            <div className="ml-auto flex border border-border">
+              {(['compact','full'] as const).map(m => (
+                <button key={m} type="button" onClick={() => setView(m)}
+                  className={`px-2 py-0.5 text-[10px] font-mono transition-colors ${view === m ? 'bg-primary/10 text-primary' : 'text-muted-foreground/60 hover:text-foreground'}`}>
+                  {m}
+                </button>
+              ))}
+            </div>
           </div>
 
           {isLoading && (
@@ -728,7 +874,12 @@ export default function Index() {
               No audio samples found yet. Be the first to publish one.
             </p>
           )}
-          {samples.length > 0 && (
+          {samples.length > 0 && view === 'compact' && (
+            <div className="border border-border divide-y divide-border">
+              {samples.map(s => <SampleRow key={s.id} sample={s} />)}
+            </div>
+          )}
+          {samples.length > 0 && view === 'full' && (
             <div className="grid sm:grid-cols-2 gap-3">
               {samples.map(s => <SampleCard key={s.id} sample={s} />)}
             </div>
