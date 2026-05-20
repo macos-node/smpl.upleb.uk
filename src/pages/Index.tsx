@@ -188,6 +188,9 @@ const SQUARE_COLORS = Array.from({ length: SQUARE_COUNT }, (_, i) => {
 
 // ── Audio feed via native WebSocket ──────────────────────────────────────────
 const RELAY_URL = 'wss://relay.fizx.uk';
+// Computed once at module load — keeping it stable so the hero RelayStats
+// filter doesn't change every render (which would reopen its WebSocket).
+const RELAY_STATS_SINCE = Math.floor(Date.now() / 1000) - 86400 * 90;
 const AUDIO_EXTS = /\.(mp3|ogg|wav|flac|m4a|aac|opus|weba)(\?.*)?$/i;
 const AUDIO_MIME = /^audio\//i;
 
@@ -813,7 +816,7 @@ export default function Index() {
             <div className="hidden sm:block shrink-0">
               <RelayStats
                 urls={[RELAY_URL]}
-                filter={{ kinds: [1, 1063], limit: 100, since: Math.floor(Date.now() / 1000) - 86400 * 90 }}
+                filter={{ kinds: [1, 1063], limit: 100, since: RELAY_STATS_SINCE }}
               />
             </div>
           </div>
