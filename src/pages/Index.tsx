@@ -1,4 +1,6 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useReactions, type ReactionAgg } from '@/hooks/useReactions';
+import ReactionBadge from '@/components/ReactionBadge';
 import { Loader2, Radio, Upload, Play, Pause, Download, Copy, Check } from 'lucide-react';
 import RelayStats from '@/components/RelayStats';
 
@@ -483,7 +485,7 @@ function Waveform({ audioRef, playing }: { audioRef: React.RefObject<HTMLAudioEl
 }
 
 // ── SampleCard ────────────────────────────────────────────────────────────────
-function SampleCard({ sample }: { sample: AudioSample }) {
+function SampleCard({ sample, reactions }: { sample: AudioSample; reactions: ReactionAgg }) {
   const [playing, setPlaying] = useState(false);
   const [copied, setCopied] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -522,6 +524,9 @@ function SampleCard({ sample }: { sample: AudioSample }) {
               tagged: {sample.tagged.map(h => h.slice(0, 8) + '…').join(', ')}
             </p>
           )}
+          {(reactions.up > 0 || reactions.down > 0) && (
+            <div className="mt-1"><ReactionBadge agg={reactions} /></div>
+          )}
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <button onClick={copyShare} title="Copy note link" className="text-muted-foreground hover:text-primary transition-colors">
@@ -548,7 +553,7 @@ function SampleCard({ sample }: { sample: AudioSample }) {
 }
 
 // ── SampleRow (compact one-line view) ─────────────────────────────────────────
-function SampleRow({ sample }: { sample: AudioSample }) {
+function SampleRow({ sample, reactions }: { sample: AudioSample; reactions: ReactionAgg }) {
   const [playing, setPlaying] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
 
@@ -573,6 +578,7 @@ function SampleRow({ sample }: { sample: AudioSample }) {
       {sample.tagged && sample.tagged.length > 0 && (
         <span className="shrink-0 text-[10px] font-mono text-accent/60" title={`${sample.tagged.length} tagged`}>·{sample.tagged.length}</span>
       )}
+      <ReactionBadge agg={reactions} />
       <span className="shrink-0 text-[10px] font-mono text-muted-foreground/50 tabular-nums w-14 text-right">
         {new Date(sample.created_at * 1000).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })}
       </span>
@@ -764,6 +770,8 @@ function UploadArea({ pubkey }: { pubkey: string | null }) {
 export default function Index() {
   const { pubkey } = useNostrLogin();
   const { samples, isLoading, isError } = useAudioFeed();
+  const sampleIds = useMemo(() => samples.map(s => s.id), [samples]);
+  const { forSample: reactionsFor } = useReactions(sampleIds);
   const [tick, setTick] = useState(0);
   const [view, setView] = useState<'compact' | 'full'>(() => {
     try { const v = localStorage.getItem('smpl_view'); if (v === 'compact' || v === 'full') return v; } catch {} /* */
@@ -870,12 +878,12 @@ export default function Index() {
           )}
           {samples.length > 0 && view === 'compact' && (
             <div className="border border-border divide-y divide-border">
-              {samples.map(s => <SampleRow key={s.id} sample={s} />)}
+              {samples.map(s => <SampleRow key={s.id} sample={s} reactions={reactionsFor(s.id)} />)}
             </div>
           )}
           {samples.length > 0 && view === 'full' && (
             <div className="grid sm:grid-cols-2 gap-3">
-              {samples.map(s => <SampleCard key={s.id} sample={s} />)}
+              {samples.map(s => <SampleCard key={s.id} sample={s} reactions={reactionsFor(s.id)} />)}
             </div>
           )}
         </section>
